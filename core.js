@@ -1,199 +1,345 @@
-// core.js —— 纯逻辑：文本清洗、旁白/对白切分、说话人性别判断、音高估计。
-// 不依赖酒馆，可在 Node 里单独测试。
+/**
+ * tavern-audiobook core.js (v2)
+ * 核心能力：
+ * 1. 清洗 <...> 标签与常见正文状态栏
+ * 2. 音源单例复用 + 音频缓存（避免每次重加载音源与重复合成）
+ * 3. 先扫描要读的分段 -> 全部生成音频 -> 再统一按序播放（缓解手机端主线程阻塞）
+ */
 
-const FEMALE_WORDS = ['女', '姑娘', '小姐', '姐', '妹', '妈', '母亲', '娘', '妻', '夫人', '公主', '王后', '阿姨', '奶奶', '婆', '太太', '少妇', '闺'];
-const MALE_WORDS = ['男', '少年', '先生', '哥', '弟', '爸', '父亲', '叔', '爷', '夫君', '丈夫', '王子', '国王', '大叔', '公子', '兄', '汉子'];
+export function sanitizeAudiobookText(rawText, customOptions = {}) {
+  if (!rawText || typeof rawText !== "string") return "";
 
-function countOf(text, word) {
-    let n = 0, i = 0;
-    while ((i = text.indexOf(word, i)) !== -1) { n++; i += word.length; }
-    return n;
-}
+  let text = rawText;
 
-function safeRegex(src, flags, fallbackSrc) {
-    try { return new RegExp(src, flags); } catch { return new RegExp(fallbackSrc, flags); }
-}
+  // 1. 跳过/移除所有 <...> 标签及其内部内容（支持嵌套）
+  let prev;
+  do {
+    prev = text;
+    text = text.replace(/<[^<>]*>/g, "");
+  } while (text !== prev);
 
-const RE_HE = safeRegex('(?<![其另])他(?![人们处])', 'g', '他');
-const RE_SHE = /她/g;
-const RE_EN_F = /\b(she|her|hers|woman|girl|female|lady|mother|sister)\b/gi;
-const RE_EN_M = /\b(he|his|him|man|boy|male|sir|father|brother)\b/gi;
+  // 2. 移除代码块包裹的状态栏
+  text = text.replace(/```[\s\S]*?```/g, "");
 
-/** 统计文本里偏男/偏女的线索数量 */
-export function countGender(text) {
-    const t = text || '';
-    let f = (t.match(RE_SHE) || []).length * 2;
-    let m = (t.match(RE_HE) || []).length * 2;
-    for (const w of FEMALE_WORDS) f += countOf(t, w);
-    for (const w of MALE_WORDS) m += countOf(t, w);
-    f += (t.match(RE_EN_F) || []).length;
-    m += (t.match(RE_EN_M) || []).length;
-    return { m, f };
-}
+  // 3. 移除独立成段的状态栏/属性栏/数值面板
+  text = text.replace(
+    /(?:^|\n)[ \t]*(?:[-─═=*]{3,}|[【\[](?:状态|属性|面板|系统|数值|好感|背包|时间|地点|角色卡)[^\n\]]*[】\]])[\s\S]*?(?=\n{2,}|$)/g,
+    "\n"
+  );
 
-/** 根据角色卡判断角色性别，返回 'male' | 'female' | null */
-export function characterGender(char) {
-    if (!char) return null;
-    const text = [char.description, char.personality, char.scenario].filter(Boolean).join('\n');
-    const explicit = text.match(/(性别|gender|sex)\s*[:：=]\s*(女|男|female|male|woman|man)/i);
-    if (explicit) {
-        return /女|female|woman/i.test(explicit[2]) ? 'female' : 'male';
+  // 4. 移除单行状态字段（如“好感度：60 / 生命值：100/100”）
+  text = text.replace(
+    /^.*(?:好感度|心情值|理智值|当前状态|生命值|体力值|MP|HP)[：:].*$/gm,
+    ""
+  );
+
+  // 5. 可选：支持自定义忽略的标签名或正则规则
+  if (Array.isArray(customOptions.ignoredTags)) {
+    for (const tag of customOptions.ignoredTags) {
+      if (!tag) continue;
+      const escaped = String(tag).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const blockRegex = new RegExp(`<${escaped}(?:\s[^>]*)?>[\s\S]*?<\/${escaped}>`, "gi");
+      const selfCloseRegex = new RegExp(`<${escaped}(?:\s[^>]*)?\/?>`, "gi");
+      text = text.replace(blockRegex, "").replace(selfCloseRegex, "");
     }
-    const { m, f } = countGender(text);
-    if (f > m) return 'female';
-    if (m > f) return 'male';
-    return null;
-}
+  }
 
-/** 清洗要朗读的文本 */
-export function cleanText(raw, opts = {}) {
-    let t = String(raw ?? '');
-    const tags = String(opts.skipTags || '').split(/[,，\s]+/).filter(Boolean);
-    for (const tag of tags) {
-        const esc = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        t = t.replace(new RegExp(`<${esc}(\\s[^>]*)?>[\\s\\S]*?</${esc}>`, 'gi'), '');
-    }
-    t = t.replace(/```[\s\S]*?```/g, '');
-    t = t.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
-    t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
-    t = t.replace(/https?:\/\/\S+/g, '');
-    t = t.replace(/<[^>]+>/g, '');
-    t = t.replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-    if (opts.skipParen) {
-        t = t.replace(/（[^（）]*）/g, '').replace(/\([^()]*\)/g, '').replace(/【[^【】]*】/g, '').replace(/\[[^\[\]]*\]/g, '');
-    }
-    t = t.replace(/^\s{0,3}#{1,6}\s*/gm, '').replace(/^\s*>\s?/gm, '');
-    t = t.replace(/[*_~`]+/g, '');
-    try { t = t.replace(/\p{Extended_Pictographic}/gu, ''); } catch { /* 旧浏览器忽略 */ }
-    t = t.replace(/[ \t　]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
-    return t;
-}
-
-const QUOTE_RE = /“[^”]*”|「[^」]*」|『[^』]*』|"[^"\n]*"/g;
-
-/** 切成 旁白 / 对白 段，并带上前后文用于判断说话人 */
-export function segment(text) {
-    const out = [];
-    let last = 0, m;
-    QUOTE_RE.lastIndex = 0;
-    while ((m = QUOTE_RE.exec(text)) !== null) {
-        if (m.index > last) out.push({ kind: 'narration', text: text.slice(last, m.index) });
-        out.push({
-            kind: 'dialogue',
-            text: m[0].slice(1, -1),
-            // 前后文只取同一段落内、相邻引号之间的叙述，避免把别人的线索算进来
-            before: text.slice(Math.max(0, m.index - 24), m.index).split(/\n|“|”|「|」|『|』|"/).pop(),
-            after: text.slice(m.index + m[0].length, m.index + m[0].length + 24).split(/\n|“|”|「|」|『|』|"/)[0],
-        });
-        last = m.index + m[0].length;
-    }
-    if (last < text.length) out.push({ kind: 'narration', text: text.slice(last) });
-    return out;
-}
-
-const SPEAKABLE = /[\p{L}\p{N}]/u;
-
-/** 把一段文字切成适合逐句合成的短句 */
-export function splitSentences(text, maxLen = 60) {
-    const raw = text.match(/[^。！？!?；;\n]+[。！？!?；;…]*/g) || [];
-    const pieces = [];
-    for (let p of raw) {
-        p = p.trim();
-        if (!p) continue;
-        while (p.length > maxLen) {
-            let cut = -1;
-            for (let i = maxLen; i > maxLen / 2; i--) {
-                if ('，,、：: '.includes(p[i])) { cut = i + 1; break; }
-            }
-            if (cut < 0) cut = maxLen;
-            pieces.push(p.slice(0, cut));
-            p = p.slice(cut);
-        }
-        if (p) pieces.push(p);
-    }
-    const merged = [];
-    for (const p of pieces) {
-        const prev = merged[merged.length - 1];
-        if (prev !== undefined && prev.length < 8 && prev.length + p.length <= maxLen) merged[merged.length - 1] = prev + p;
-        else merged.push(p);
-    }
-    return merged.filter(s => SPEAKABLE.test(s));
-}
-
-/** 判断一句对白是谁说的（男/女），拿不准就返回 fallback */
-export function inferDialogueGender(before, after, ctx) {
-    const b = before.slice(-20);
-    const a = after.slice(0, 20);
-    const cb = countGender(b), ca = countGender(a);
-    let m = cb.m + ca.m, f = cb.f + ca.f;
-    const near = b + '|' + a;
-    if (ctx.charName && near.includes(ctx.charName)) {
-        if (ctx.charGender === 'male') m += 3; else if (ctx.charGender === 'female') f += 3;
-    }
-    if (ctx.userName && near.includes(ctx.userName)) {
-        if (ctx.userGender === 'male') m += 3; else if (ctx.userGender === 'female') f += 3;
-    }
-    if (f > m) return 'female';
-    if (m > f) return 'male';
-    return ctx.fallbackGender || null;
+  return text
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /**
- * 把一条消息变成朗读队列。
- * ctx: { charName, userName, charGender, userGender, fallbackGender, readNarration, readDialogue }
- * 返回 [{ text, kind: 'narration'|'dialogue', gender: 'male'|'female'|null }]
+ * 将清洗后的正文切分为旁白/对白分段
+ * 支持中英文引号“...” / "..." 以及最大字数拆分
  */
-export function buildItems(clean, ctx) {
-    const items = [];
-    for (const seg of segment(clean)) {
-        if (seg.kind === 'narration' && !ctx.readNarration) continue;
-        if (seg.kind === 'dialogue' && !ctx.readDialogue) continue;
-        const gender = seg.kind === 'dialogue' ? inferDialogueGender(seg.before, seg.after, ctx) : null;
-        for (const s of splitSentences(seg.text, ctx.maxLen || 60)) items.push({ text: s, kind: seg.kind, gender });
+export function splitIntoSegments(cleanedText, options = {}) {
+  const maxChars = Number(options.maxChars) > 0 ? Number(options.maxChars) : 80;
+  const readNarration = options.readNarration !== false;
+  const readDialogue = options.readDialogue !== false;
+  const skipBrackets = Boolean(options.skipBrackets);
+
+  let working = cleanedText;
+  if (skipBrackets) {
+    working = working
+      .replace(/（[^（）]*）/g, "")
+      .replace(/\([^()]*\)/g, "")
+      .replace(/\[[^\[\]]*\]/g, "");
+  }
+
+  // 按引号提取对白与旁白
+  const rawParts = [];
+  const tokenRegex = /(“[^”]*”|"[^"]*")/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = tokenRegex.exec(working)) !== null) {
+    if (match.index > lastIndex) {
+      const narration = working.slice(lastIndex, match.index).trim();
+      if (narration && readNarration) {
+        rawParts.push({ type: "narration", text: narration });
+      }
     }
-    return items;
+    const dialogue = match[0].replace(/^[“"]|[”"]$/g, "").trim();
+    if (dialogue && readDialogue) {
+      rawParts.push({ type: "dialogue", text: dialogue });
+    }
+    lastIndex = tokenRegex.lastIndex;
+  }
+
+  if (lastIndex < working.length) {
+    const tail = working.slice(lastIndex).trim();
+    if (tail && readNarration) {
+      rawParts.push({ type: "narration", text: tail });
+    }
+  }
+
+  // 按 maxChars 进一步切分，避免单次 WASM 推理过长导致页面卡顿
+  const segments = [];
+  for (const part of rawParts) {
+    const chunks = chunkTextByLength(part.text, maxChars);
+    for (const chunk of chunks) {
+      if (chunk.trim()) {
+        segments.push({
+          type: part.type,
+          text: chunk.trim(),
+        });
+      }
+    }
+  }
+
+  return segments;
 }
 
-/** 用自相关估计基频，返回中位数 Hz（失败返回 0） */
-export function estimateF0(x, sr) {
-    const win = Math.floor(sr * 0.04), hop = Math.floor(sr * 0.02);
-    const minLag = Math.max(2, Math.floor(sr / 400)), maxLag = Math.floor(sr / 70);
-    let e = 0;
-    for (let i = 0; i < x.length; i++) e += x[i] * x[i];
-    const rmsAll = Math.sqrt(e / Math.max(1, x.length));
-    const f0s = [];
-    const nacf = new Float32Array(maxLag + 1);
-    for (let st = 0; st + win + maxLag < x.length; st += hop) {
-        let r0 = 0;
-        for (let i = 0; i < win; i++) r0 += x[st + i] * x[st + i];
-        if (Math.sqrt(r0 / win) < rmsAll * 0.6) continue;
-        let best = 0;
-        for (let lag = minLag; lag <= maxLag; lag++) {
-            let c = 0, rl = 0;
-            for (let i = 0; i < win; i++) {
-                const y = x[st + i + lag];
-                c += x[st + i] * y;
-                rl += y * y;
-            }
-            const n = c / Math.sqrt(r0 * rl + 1e-9);
-            nacf[lag] = n;
-            if (n > best) best = n;
+function chunkTextByLength(text, maxChars) {
+  if (text.length <= maxChars) return [text];
+
+  const result = [];
+  let buf = "";
+  const sentences = text.split(/(?<=[。！？!?；;…\n])/);
+
+  for (const s of sentences) {
+    if (!s) continue;
+    if ((buf + s).length <= maxChars) {
+      buf += s;
+    } else {
+      if (buf.trim()) result.push(buf.trim());
+      if (s.length <= maxChars) {
+        buf = s;
+      } else {
+        for (let i = 0; i < s.length; i += maxChars) {
+          result.push(s.slice(i, i + maxChars));
         }
-        if (best < 0.5) continue;
-        // 取第一个接近最大值的峰，避免跳到二倍周期（八度错误）
-        for (let lag = minLag + 1; lag < maxLag; lag++) {
-            if (nacf[lag] >= best * 0.9 && nacf[lag] >= nacf[lag - 1] && nacf[lag] >= nacf[lag + 1]) {
-                f0s.push(sr / lag);
-                break;
-            }
-        }
+        buf = "";
+      }
     }
-    if (f0s.length < 3) return 0;
-    f0s.sort((a, b) => a - b);
-    return f0s[Math.floor(f0s.length / 2)];
+  }
+
+  if (buf.trim()) result.push(buf.trim());
+  return result;
 }
 
-export function genderFromF0(f0) {
-    if (!f0) return null;
-    return f0 < 155 ? 'male' : 'female';
+export class AudiobookEngine {
+  constructor(initLocalTtsFn) {
+    this.initLocalTtsFn = initLocalTtsFn;
+    this.localTtsInstance = null;
+    this.loadingPromise = null;
+    this.audioCache = new Map();
+    this.currentAudio = null;
+    this.isStopped = false;
+    this.isPaused = false;
+  }
+
+  /**
+   * 音源单例初始化：首次调用时加载，后续直接复用，不再重复加载模型
+   */
+  async ensureLocalTtsLoaded(onStatus) {
+    if (this.localTtsInstance) {
+      return this.localTtsInstance;
+    }
+    if (this.loadingPromise) {
+      return this.loadingPromise;
+    }
+
+    this.loadingPromise = (async () => {
+      try {
+        onStatus?.("正在加载本地音源（仅首次需要）...");
+        this.localTtsInstance = await this.initLocalTtsFn(onStatus);
+        onStatus?.("本地音源已就绪");
+        return this.localTtsInstance;
+      } finally {
+        this.loadingPromise = null;
+      }
+    })();
+
+    return this.loadingPromise;
+  }
+
+  clearCache() {
+    for (const url of this.audioCache.values()) {
+      if (typeof url === "string" && url.startsWith("blob:")) {
+        URL.revokeObjectURL(url);
+      }
+    }
+    this.audioCache.clear();
+  }
+
+  stop() {
+    this.isStopped = true;
+    this.isPaused = false;
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.currentAudio.currentTime = 0;
+      this.currentAudio = null;
+    }
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+  }
+
+  /**
+   * 扫描过滤 -> 全部生成 -> 再读出来
+   */
+  async scanGenerateAllAndPlay(rawText, config = {}, callbacks = {}) {
+    this.stop();
+    this.isStopped = false;
+
+    const {
+      onProgress,
+      resolveVoiceId,
+      synthesizeSegment, // (segment, voiceId, ttsInstance) => Promise<string (audioUrl)>
+    } = callbacks;
+
+    // 1. 扫描并清洗
+    const cleaned = sanitizeAudiobookText(rawText, config);
+    const segments = splitIntoSegments(cleaned, config);
+
+    if (segments.length === 0) {
+      onProgress?.({ stage: "empty", message: "未扫描到可朗读的正文内容" });
+      return;
+    }
+
+    onProgress?.({
+      stage: "scanned",
+      total: segments.length,
+      message: `扫描完成（共 ${segments.length} 段），开始全部生成语音...`,
+    });
+
+    // 确保本地音源已加载（已加载则直接复用）
+    let ttsInstance = null;
+    if (config.engine !== "system" && typeof synthesizeSegment === "function") {
+      ttsInstance = await this.ensureLocalTtsLoaded((msg) =>
+        onProgress?.({ stage: "loading_engine", message: msg })
+      );
+    }
+
+    // 2. 全部生成音频
+    const playlist = [];
+    for (let i = 0; i < segments.length; i++) {
+      if (this.isStopped) return;
+
+      const seg = segments[i];
+      const voiceId = resolveVoiceId ? resolveVoiceId(seg, i) : "default";
+      const cacheKey = `${config.engine || "local"}|${voiceId}|${config.speed || 1}|${seg.text}`;
+
+      let audioUrl = this.audioCache.get(cacheKey);
+      if (!audioUrl) {
+        if (config.engine === "system") {
+          audioUrl = { type: "system", text: seg.text, voiceId };
+        } else {
+          audioUrl = await synthesizeSegment(seg, voiceId, ttsInstance);
+        }
+        this.audioCache.set(cacheKey, audioUrl);
+      }
+
+      playlist.push({
+        ...seg,
+        voiceId,
+        audioUrl,
+      });
+
+      onProgress?.({
+        stage: "generating",
+        current: i + 1,
+        total: segments.length,
+        message: `全部生成中：${i + 1} / ${segments.length}`,
+      });
+
+      // 让出主线程，减少手机端连续合成导致的界面卡顿
+      await new Promise((r) => setTimeout(r, 12));
+    }
+
+    if (this.isStopped) return;
+
+    onProgress?.({
+      stage: "ready",
+      total: playlist.length,
+      message: `全部 ${playlist.length} 段生成完毕，开始朗读`,
+    });
+
+    // 3. 全部生成完成后，再统一按顺序播放
+    const rate = Number(config.rate) > 0 ? Number(config.rate) : 1.0;
+    const volume =
+      config.volume !== undefined ? Math.min(1, Math.max(0, Number(config.volume))) : 1.0;
+
+    for (let i = 0; i < playlist.length; i++) {
+      if (this.isStopped) return;
+      const item = playlist[i];
+
+      onProgress?.({
+        stage: "playing",
+        current: i + 1,
+        total: playlist.length,
+        segment: item,
+        message: `正在朗读 (${i + 1}/${playlist.length})`,
+      });
+
+      if (typeof item.audioUrl === "object" && item.audioUrl?.type === "system") {
+        await this._playSystemUtterance(item.audioUrl.text, rate, volume);
+      } else {
+        await this._playAudioUrl(item.audioUrl, rate, volume);
+      }
+    }
+
+    onProgress?.({
+      stage: "completed",
+      message: "朗读完成",
+    });
+  }
+
+  _playAudioUrl(url, playbackRate, volume) {
+    return new Promise((resolve, reject) => {
+      if (this.isStopped) return resolve();
+      const audio = new Audio(url);
+      this.currentAudio = audio;
+      audio.playbackRate = playbackRate;
+      audio.volume = volume;
+      audio.onended = () => {
+        this.currentAudio = null;
+        resolve();
+      };
+      audio.onerror = (e) => {
+        this.currentAudio = null;
+        reject(e);
+      };
+      audio.play().catch((err) => {
+        this.currentAudio = null;
+        reject(err);
+      });
+    });
+  }
+
+  _playSystemUtterance(text, rate, volume) {
+    return new Promise((resolve) => {
+      if (this.isStopped || typeof window === "undefined" || !window.speechSynthesis) {
+        return resolve();
+      }
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = rate;
+      utter.volume = volume;
+      utter.onend = () => resolve();
+      utter.onerror = () => resolve();
+      window.speechSynthesis.speak(utter);
+    });
+  }
 }
