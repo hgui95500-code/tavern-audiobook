@@ -237,9 +237,6 @@ export class AudiobookEngine {
     }
   }
 
-  /**
-   * 暂停朗诵
-   */
   pause() {
     if (this.isStopped || !this.playlist.length || this.isPaused) return false;
     this.isPaused = true;
@@ -257,9 +254,6 @@ export class AudiobookEngine {
     return true;
   }
 
-  /**
-   * 继续朗诵
-   */
   resume() {
     if (this.isStopped || !this.playlist.length || !this.isPaused) return false;
     this.isPaused = false;
@@ -285,9 +279,6 @@ export class AudiobookEngine {
     return true;
   }
 
-  /**
-   * 切换暂停/继续
-   */
   togglePause() {
     if (!this.playlist.length) return false;
     if (this.isPaused) {
@@ -381,9 +372,6 @@ export class AudiobookEngine {
     this.onProgressCb?.({ stage: "stopped", paused: false, message: "已停止朗读" });
   }
 
-  /**
-   * 完整流程：扫描过滤 -> 全部生成 -> 再读出来
-   */
   async scanGenerateAllAndPlay(rawText, config = {}, callbacks = {}) {
     this.stop();
     this.isStopped = false;

@@ -172,8 +172,7 @@ export async function speakFromMessageElement(mesEl, rawText) {
   updateFloatingBarState("active");
 
   const ignoredTags = (settings.ignoredTagsText || "")
-    .split(/[,，
-]+/)
+    .split(/[,，\n]+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
@@ -315,6 +314,68 @@ function createFloatingBar() {
     engine.setRate(newRate);
     updateFloatingBarState(engine.playlist?.length ? "active" : "idle");
   });
+}
+
+function getWandMenuContainer() {
+  return (
+    document.getElementById("extensionsMenu") ||
+    document.querySelector("#extensions-menu") ||
+    document.querySelector(".extensions_menu") ||
+    null
+  );
+}
+
+function createWandMenuItem() {
+  if (document.getElementById("stab_wand_item")) return;
+  const menu = getWandMenuContainer();
+  if (!menu) return;
+
+  const item = document.createElement("div");
+  item.id = "stab_wand_item";
+  item.className = "extension_container";
+  item.innerHTML = `
+    <div id="stab_wand_read_latest" class="list-group-item flex-container flexGap5 interactable" tabindex="0" title="朗读最新一条 AI 回复">
+      <div class="fa-solid fa-headphones extensionsMenuExtensionButton"></div>
+      <span>听书：朗读最新回复</span>
+    </div>
+    <div id="stab_wand_pause" class="list-group-item flex-container flexGap5 interactable" tabindex="0" title="暂停或继续当前朗诵">
+      <div class="fa-solid fa-pause extensionsMenuExtensionButton"></div>
+      <span>听书：暂停/继续</span>
+    </div>
+    <div id="stab_wand_stop" class="list-group-item flex-container flexGap5 interactable" tabindex="0" title="停止当前朗诵">
+      <div class="fa-solid fa-stop extensionsMenuExtensionButton"></div>
+      <span>听书：停止朗诵</span>
+    </div>
+  `;
+
+  menu.appendChild(item);
+
+  document.getElementById("stab_wand_read_latest")?.addEventListener("click", () => {
+    const latest = getLatestAiMessageText();
+    speakFromMessageElement(latest.mesEl, latest.text);
+  });
+
+  document.getElementById("stab_wand_pause")?.addEventListener("click", () => {
+    togglePauseAudiobook();
+  });
+
+  document.getElementById("stab_wand_stop")?.addEventListener("click", () => {
+    stopAudiobook();
+  });
+}
+
+function bindWandButtonFallback() {
+  const wandBtn =
+    document.getElementById("extensionsMenuButton") ||
+    document.querySelector("#extensions_menu_button") ||
+    document.querySelector(".extensionsMenuButton");
+
+  if (wandBtn && !wandBtn.dataset.stabBound) {
+    wandBtn.dataset.stabBound = "1";
+    wandBtn.addEventListener("click", () => {
+      setTimeout(() => createWandMenuItem(), 50);
+    });
+  }
 }
 
 function createSettingsPanel() {
@@ -467,6 +528,8 @@ function observeChatMessages() {
   const start = () => {
     createSettingsPanel();
     createFloatingBar();
+    createWandMenuItem();
+    bindWandButtonFallback();
     injectAllMessageButtons();
     observeChatMessages();
   };
