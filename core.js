@@ -1,9 +1,9 @@
 /**
- * tavern-audiobook core.js (v2)
- * 核心能力：
- * 1. 清洗 <...> 标签与常见正文状态栏
- * 2. 音源单例复用 + 音频缓存（避免每次重加载音源与重复合成）
- * 3. 先扫描要读的分段 -> 全部生成音频 -> 再统一按序播放（缓解手机端主线程阻塞）
+ * tavern-audiobook core.js
+ * 1. 跳过/移除 <...> 标签及常见正文状态栏（在切分句子前彻底清理）
+ * 2. 音源单例复用 + 音频缓存（避免每次重加载音源、重复合成同一段文本）
+ * 3. 先扫描要读哪些 -> 全部生成音频（每段间让出主线程减少卡顿） -> 再按顺序读出来
+ * 4. 支持上一句 / 下一句 / 暂停与继续 / 停止 / 倍速切换
  */
 
 export function sanitizeAudiobookText(rawText, customOptions = {}) {
@@ -11,33 +11,38 @@ export function sanitizeAudiobookText(rawText, customOptions = {}) {
 
   let text = rawText;
 
-  // 1. 跳过/移除所有 <...> 标签及其内部内容（支持嵌套）
+  // 1. 移除所有 <...> 标签及其内容（支持嵌套标签，例如 <details><summary>...</summary>...</details>）
   let prev;
   do {
     prev = text;
     text = text.replace(/<[^<>]*>/g, "");
   } while (text !== prev);
 
-  // 2. 移除代码块包裹的状态栏
+  // 2. 移除常见状态栏：三引号代码块状态栏
   text = text.replace(/```[\s\S]*?```/g, "");
 
-  // 3. 移除独立成段的状态栏/属性栏/数值面板
+  // 3. 移除独立成段的状态栏 / 面板 / 属性块（如 --- 状态 ---、【状态栏】、[状态] 等）
   text = text.replace(
-    /(?:^|\n)[ \t]*(?:[-─═=*]{3,}|[【\[](?:状态|属性|面板|系统|数值|好感|背包|时间|地点|角色卡)[^\n\]]*[】\]])[\s\S]*?(?=\n{2,}|$)/g,
+    /(?:^|\n)[ \t]*(?:[-─═=*]{3,}|[【\[](?:状态|属性|面板|系统|数值|好感|背包|时间|地点|角色卡|状态栏|信息栏)[^\n\]]*[】\]])[\s\S]*?(?=\n{2,}|$)/g,
     "\n"
   );
 
-  // 4. 移除单行状态字段（如“好感度：60 / 生命值：100/100”）
+  // 4. 移除单行状态字段（如“好感度：60 / 生命值：100/100 / 当前状态：...”或带竖线分隔的状态行）
   text = text.replace(
-    /^.*(?:好感度|心情值|理智值|当前状态|生命值|体力值|MP|HP)[：:].*$/gm,
+    /^.*(?:好感度|心情值|理智值|当前状态|生命值|体力值|精力值|饥饿度|MP|HP)[：:].*$/gm,
+    ""
+  );
+  text = text.replace(
+    /^[^\n。！？!?]*[|｜][^\n。！？!?]*(?:好感|状态|属性|等级|LV|Lv|HP|MP|时间|地点)[^\n]*$/gm,
     ""
   );
 
-  // 5. 可选：支持自定义忽略的标签名或正则规则
+  // 5. 支持用户配置的额外忽略标签
   if (Array.isArray(customOptions.ignoredTags)) {
-    for (const tag of customOptions.ignoredTags) {
+    for (const rawTag of customOptions.ignoredTags) {
+      const tag = String(rawTag || "").trim().replace(/^<|>$/g, "");
       if (!tag) continue;
-      const escaped = String(tag).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const blockRegex = new RegExp(`<${escaped}(?:\s[^>]*)?>[\s\S]*?<\/${escaped}>`, "gi");
       const selfCloseRegex = new RegExp(`<${escaped}(?:\s[^>]*)?\/?>`, "gi");
       text = text.replace(blockRegex, "").replace(selfCloseRegex, "");
@@ -49,12 +54,8 @@ export function sanitizeAudiobookText(rawText, customOptions = {}) {
     .trim();
 }
 
-/**
- * 将清洗后的正文切分为旁白/对白分段
- * 支持中英文引号“...” / "..." 以及最大字数拆分
- */
 export function splitIntoSegments(cleanedText, options = {}) {
-  const maxChars = Number(options.maxChars) > 0 ? Number(options.maxChars) : 80;
+  const maxChars = Number(options.maxChars) > 0 ? Number(options.maxChars) : 45;
   const readNarration = options.readNarration !== false;
   const readDialogue = options.readDialogue !== false;
   const skipBrackets = Boolean(options.skipBrackets);
@@ -67,7 +68,6 @@ export function splitIntoSegments(cleanedText, options = {}) {
       .replace(/\[[^\[\]]*\]/g, "");
   }
 
-  // 按引号提取对白与旁白
   const rawParts = [];
   const tokenRegex = /(“[^”]*”|"[^"]*")/g;
   let lastIndex = 0;
@@ -94,15 +94,15 @@ export function splitIntoSegments(cleanedText, options = {}) {
     }
   }
 
-  // 按 maxChars 进一步切分，避免单次 WASM 推理过长导致页面卡顿
   const segments = [];
   for (const part of rawParts) {
     const chunks = chunkTextByLength(part.text, maxChars);
     for (const chunk of chunks) {
-      if (chunk.trim()) {
+      const cleanedChunk = chunk.trim();
+      if (cleanedChunk) {
         segments.push({
           type: part.type,
-          text: chunk.trim(),
+          text: cleanedChunk,
         });
       }
     }
@@ -139,6 +139,46 @@ function chunkTextByLength(text, maxChars) {
   return result;
 }
 
+/**
+ * 将 float32 采样转为标准 WAV Blob URL，便于浏览器稳定播放
+ */
+export function samplesToWavBlobUrl(samples, sampleRate = 22050) {
+  if (!samples || !samples.length) return "";
+  const numSamples = samples.length;
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, numSamples * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+
+  const blob = new Blob([buffer], { type: "audio/wav" });
+  return URL.createObjectURL(blob);
+}
+
 export class AudiobookEngine {
   constructor(initLocalTtsFn) {
     this.initLocalTtsFn = initLocalTtsFn;
@@ -148,10 +188,16 @@ export class AudiobookEngine {
     this.currentAudio = null;
     this.isStopped = false;
     this.isPaused = false;
+    this.playlist = [];
+    this.currentIndex = 0;
+    this.currentRate = 1.0;
+    this.currentVolume = 1.0;
+    this.onProgressCb = null;
+    this._stepResolver = null;
   }
 
   /**
-   * 音源单例初始化：首次调用时加载，后续直接复用，不再重复加载模型
+   * 音源单例复用：只加载一次，后续直接使用已加载实例
    */
   async ensureLocalTtsLoaded(onStatus) {
     if (this.localTtsInstance) {
@@ -163,7 +209,7 @@ export class AudiobookEngine {
 
     this.loadingPromise = (async () => {
       try {
-        onStatus?.("正在加载本地音源（仅首次需要）...");
+        onStatus?.("加载本地音源（仅首次需要，后续复用）...");
         this.localTtsInstance = await this.initLocalTtsFn(onStatus);
         onStatus?.("本地音源已就绪");
         return this.localTtsInstance;
@@ -175,19 +221,91 @@ export class AudiobookEngine {
     return this.loadingPromise;
   }
 
+  isLocalLoaded() {
+    return Boolean(this.localTtsInstance);
+  }
+
   clearCache() {
-    for (const url of this.audioCache.values()) {
-      if (typeof url === "string" && url.startsWith("blob:")) {
-        URL.revokeObjectURL(url);
+    for (const item of this.audioCache.values()) {
+      if (typeof item === "string" && item.startsWith("blob:")) {
+        URL.revokeObjectURL(item);
       }
     }
     this.audioCache.clear();
   }
 
-  stop() {
-    this.isStopped = true;
-    this.isPaused = false;
+  setRate(rate) {
+    const r = Number(rate) > 0 ? Number(rate) : 1.0;
+    this.currentRate = r;
     if (this.currentAudio) {
+      this.currentAudio.playbackRate = r;
+    }
+  }
+
+  togglePause() {
+    if (this.currentAudio) {
+      if (this.currentAudio.paused) {
+        this.isPaused = false;
+        this.currentAudio.play().catch(() => {});
+        this.onProgressCb?.({
+          stage: "playing",
+          current: this.currentIndex + 1,
+          total: this.playlist.length,
+          paused: false,
+          message: `正在朗读 (${this.currentIndex + 1}/${this.playlist.length})`,
+        });
+      } else {
+        this.isPaused = true;
+        this.currentAudio.pause();
+        this.onProgressCb?.({
+          stage: "paused",
+          current: this.currentIndex + 1,
+          total: this.playlist.length,
+          paused: true,
+          message: `已暂停 (${this.currentIndex + 1}/${this.playlist.length})`,
+        });
+      }
+      return this.isPaused;
+    }
+
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      if (window.speechSynthesis.paused) {
+        this.isPaused = false;
+        window.speechSynthesis.resume();
+      } else if (window.speechSynthesis.speaking) {
+        this.isPaused = true;
+        window.speechSynthesis.pause();
+      }
+    }
+    return this.isPaused;
+  }
+
+  prev() {
+    if (!this.playlist.length) return;
+    this.currentIndex = Math.max(0, this.currentIndex - 1);
+    this._jumpToCurrent();
+  }
+
+  next() {
+    if (!this.playlist.length) return;
+    this.currentIndex = Math.min(this.playlist.length, this.currentIndex + 1);
+    this._jumpToCurrent();
+  }
+
+  _jumpToCurrent() {
+    this.isPaused = false;
+    this._stopCurrentPlaybackOnly();
+    if (this._stepResolver) {
+      const resolve = this._stepResolver;
+      this._stepResolver = null;
+      resolve("jump");
+    }
+  }
+
+  _stopCurrentPlaybackOnly() {
+    if (this.currentAudio) {
+      this.currentAudio.onended = null;
+      this.currentAudio.onerror = null;
       this.currentAudio.pause();
       this.currentAudio.currentTime = 0;
       this.currentAudio = null;
@@ -197,149 +315,192 @@ export class AudiobookEngine {
     }
   }
 
+  stop() {
+    this.isStopped = true;
+    this.isPaused = false;
+    this.playlist = [];
+    this.currentIndex = 0;
+    this._stopCurrentPlaybackOnly();
+    if (this._stepResolver) {
+      const resolve = this._stepResolver;
+      this._stepResolver = null;
+      resolve("stop");
+    }
+    this.onProgressCb?.({ stage: "stopped", message: "已停止朗读" });
+  }
+
   /**
-   * 扫描过滤 -> 全部生成 -> 再读出来
+   * 完整流程：扫描过滤 -> 全部生成 -> 再读出来
    */
   async scanGenerateAllAndPlay(rawText, config = {}, callbacks = {}) {
     this.stop();
     this.isStopped = false;
+    this.currentRate = Number(config.rate) > 0 ? Number(config.rate) : 1.0;
+    this.currentVolume =
+      config.volume !== undefined ? Math.min(1, Math.max(0, Number(config.volume))) : 1.0;
 
     const {
       onProgress,
       resolveVoiceId,
-      synthesizeSegment, // (segment, voiceId, ttsInstance) => Promise<string (audioUrl)>
+      synthesizeSegment,
     } = callbacks;
+
+    this.onProgressCb = onProgress || null;
 
     // 1. 扫描并清洗
     const cleaned = sanitizeAudiobookText(rawText, config);
     const segments = splitIntoSegments(cleaned, config);
 
     if (segments.length === 0) {
-      onProgress?.({ stage: "empty", message: "未扫描到可朗读的正文内容" });
+      this.onProgressCb?.({ stage: "empty", message: "扫描完成：没有可朗读的正文内容" });
       return;
     }
 
-    onProgress?.({
+    this.onProgressCb?.({
       stage: "scanned",
       total: segments.length,
-      message: `扫描完成（共 ${segments.length} 段），开始全部生成语音...`,
+      message: `扫描完成（共 ${segments.length} 段），准备全部生成...`,
     });
 
-    // 确保本地音源已加载（已加载则直接复用）
+    // 2. 确保本地音源已加载（已加载则直接复用，不再重复加载）
     let ttsInstance = null;
     if (config.engine !== "system" && typeof synthesizeSegment === "function") {
       ttsInstance = await this.ensureLocalTtsLoaded((msg) =>
-        onProgress?.({ stage: "loading_engine", message: msg })
+        this.onProgressCb?.({ stage: "loading_engine", message: msg })
       );
     }
 
-    // 2. 全部生成音频
-    const playlist = [];
+    // 3. 全部生成音频（逐段生成并让出主线程，避免手机浏览器连续推理卡死）
+    const builtPlaylist = [];
+    const yieldGap = Math.max(15, Number(config.yieldMs) || 35);
+
     for (let i = 0; i < segments.length; i++) {
       if (this.isStopped) return;
 
       const seg = segments[i];
       const voiceId = resolveVoiceId ? resolveVoiceId(seg, i) : "default";
-      const cacheKey = `${config.engine || "local"}|${voiceId}|${config.speed || 1}|${seg.text}`;
+      const cacheKey = `${config.engine || "local"}|${voiceId}|${seg.text}`;
 
-      let audioUrl = this.audioCache.get(cacheKey);
-      if (!audioUrl) {
+      let audioPayload = this.audioCache.get(cacheKey);
+      if (!audioPayload) {
         if (config.engine === "system") {
-          audioUrl = { type: "system", text: seg.text, voiceId };
+          audioPayload = { type: "system", text: seg.text, voiceId };
         } else {
-          audioUrl = await synthesizeSegment(seg, voiceId, ttsInstance);
+          audioPayload = await synthesizeSegment(seg, voiceId, ttsInstance);
         }
-        this.audioCache.set(cacheKey, audioUrl);
+        if (audioPayload) {
+          this.audioCache.set(cacheKey, audioPayload);
+        }
       }
 
-      playlist.push({
-        ...seg,
-        voiceId,
-        audioUrl,
-      });
+      if (audioPayload) {
+        builtPlaylist.push({
+          ...seg,
+          voiceId,
+          audioPayload,
+        });
+      }
 
-      onProgress?.({
+      this.onProgressCb?.({
         stage: "generating",
         current: i + 1,
         total: segments.length,
         message: `全部生成中：${i + 1} / ${segments.length}`,
       });
 
-      // 让出主线程，减少手机端连续合成导致的界面卡顿
-      await new Promise((r) => setTimeout(r, 12));
+      // 让出主线程，缓解手机端连续合成导致的界面卡顿
+      await new Promise((r) => setTimeout(r, yieldGap));
     }
 
     if (this.isStopped) return;
 
-    onProgress?.({
-      stage: "ready",
-      total: playlist.length,
-      message: `全部 ${playlist.length} 段生成完毕，开始朗读`,
-    });
+    this.playlist = builtPlaylist;
+    this.currentIndex = 0;
 
-    // 3. 全部生成完成后，再统一按顺序播放
-    const rate = Number(config.rate) > 0 ? Number(config.rate) : 1.0;
-    const volume =
-      config.volume !== undefined ? Math.min(1, Math.max(0, Number(config.volume))) : 1.0;
-
-    for (let i = 0; i < playlist.length; i++) {
-      if (this.isStopped) return;
-      const item = playlist[i];
-
-      onProgress?.({
-        stage: "playing",
-        current: i + 1,
-        total: playlist.length,
-        segment: item,
-        message: `正在朗读 (${i + 1}/${playlist.length})`,
-      });
-
-      if (typeof item.audioUrl === "object" && item.audioUrl?.type === "system") {
-        await this._playSystemUtterance(item.audioUrl.text, rate, volume);
-      } else {
-        await this._playAudioUrl(item.audioUrl, rate, volume);
-      }
+    if (!this.playlist.length) {
+      this.onProgressCb?.({ stage: "empty", message: "生成结果为空，无法朗读" });
+      return;
     }
 
-    onProgress?.({
-      stage: "completed",
-      message: "朗读完成",
+    this.onProgressCb?.({
+      stage: "ready",
+      total: this.playlist.length,
+      message: `全部 ${this.playlist.length} 段已生成，开始朗读`,
     });
+
+    // 4. 全部生成完成后，再按顺序读出来
+    while (!this.isStopped && this.currentIndex < this.playlist.length) {
+      const idx = this.currentIndex;
+      const item = this.playlist[idx];
+
+      this.onProgressCb?.({
+        stage: "playing",
+        current: idx + 1,
+        total: this.playlist.length,
+        segment: item,
+        paused: this.isPaused,
+        message: `正在朗读 (${idx + 1}/${this.playlist.length})`,
+      });
+
+      const reason = await this._playSingleItem(item);
+      if (this.isStopped || reason === "stop") return;
+      if (reason === "jump") {
+        // currentIndex 已由 prev() / next() 更新
+        continue;
+      }
+      this.currentIndex = idx + 1;
+    }
+
+    if (!this.isStopped) {
+      this.playlist = [];
+      this.currentIndex = 0;
+      this.onProgressCb?.({ stage: "completed", message: "朗读完成" });
+    }
   }
 
-  _playAudioUrl(url, playbackRate, volume) {
-    return new Promise((resolve, reject) => {
-      if (this.isStopped) return resolve();
-      const audio = new Audio(url);
+  _playSingleItem(item) {
+    return new Promise((resolve) => {
+      if (this.isStopped) return resolve("stop");
+
+      this._stepResolver = (r) => {
+        this._stepResolver = null;
+        resolve(r);
+      };
+
+      const finishNormally = () => {
+        this._stepResolver = null;
+        resolve("ended");
+      };
+
+      if (typeof item.audioPayload === "object" && item.audioPayload?.type === "system") {
+        if (typeof window === "undefined" || !window.speechSynthesis) {
+          return finishNormally();
+        }
+        const utter = new SpeechSynthesisUtterance(item.audioPayload.text);
+        utter.rate = this.currentRate;
+        utter.volume = this.currentVolume;
+        utter.onend = finishNormally;
+        utter.onerror = finishNormally;
+        window.speechSynthesis.speak(utter);
+        return;
+      }
+
+      const audio = new Audio(item.audioPayload);
       this.currentAudio = audio;
-      audio.playbackRate = playbackRate;
-      audio.volume = volume;
+      audio.playbackRate = this.currentRate;
+      audio.volume = this.currentVolume;
       audio.onended = () => {
         this.currentAudio = null;
-        resolve();
+        finishNormally();
       };
-      audio.onerror = (e) => {
+      audio.onerror = () => {
         this.currentAudio = null;
-        reject(e);
+        finishNormally();
       };
-      audio.play().catch((err) => {
+      audio.play().catch(() => {
         this.currentAudio = null;
-        reject(err);
+        finishNormally();
       });
-    });
-  }
-
-  _playSystemUtterance(text, rate, volume) {
-    return new Promise((resolve) => {
-      if (this.isStopped || typeof window === "undefined" || !window.speechSynthesis) {
-        return resolve();
-      }
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = rate;
-      utter.volume = volume;
-      utter.onend = () => resolve();
-      utter.onerror = () => resolve();
-      window.speechSynthesis.speak(utter);
     });
   }
 }
