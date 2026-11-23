@@ -149,7 +149,7 @@ export function buildItems(clean, ctx) {
         if (seg.kind === 'narration' && !ctx.readNarration) continue;
         if (seg.kind === 'dialogue' && !ctx.readDialogue) continue;
         const gender = seg.kind === 'dialogue' ? inferDialogueGender(seg.before, seg.after, ctx) : null;
-        for (const s of splitSentences(seg.text)) items.push({ text: s, kind: seg.kind, gender });
+        for (const s of splitSentences(seg.text, ctx.maxLen || 60)) items.push({ text: s, kind: seg.kind, gender });
     }
     return items;
 }

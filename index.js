@@ -27,6 +27,9 @@ const DEFAULTS = {
     speed: 1.0,
     volume: 1.0,
     scanCount: 40,
+    autoLoad: false, // 打开酒馆后自动加载本地音源（载入时页面会卡几十秒，默认关）
+    chunkLen: 30, // 本地合成每段最多字数：越小页面越不卡，但停顿更多
+    showFab: true, // 显示屏幕右侧的悬浮按钮
     scanned: {}, // 说话人编号 -> 基频 Hz
     charGender: {}, // 角色 -> auto | male | female
 };
@@ -429,6 +432,7 @@ function buildForMessage(mesId) {
         fallbackGender: msg.is_user ? s.userGender : charGender,
         readNarration: s.readNarration,
         readDialogue: s.readDialogue,
+        maxLen: (s.engine === 'system' || sherpa.available === false) ? 60 : s.chunkLen,
     });
 }
 
@@ -527,6 +531,8 @@ function settingsHtml() {
   </div>
   <div class="inline-drawer-content">
     <label class="checkbox_label"><input type="checkbox" id="stab_enabled"><span>启用听书</span></label>
+    <label class="checkbox_label"><input type="checkbox" id="stab_autoLoad"><span>打开酒馆后自动加载本地音源（加载时会占用约 400MB 内存，几十秒内可能略卡）</span></label>
+    <label class="checkbox_label"><input type="checkbox" id="stab_showFab"><span>显示屏幕右侧的悬浮 🎧 按钮</span></label>
     <label class="checkbox_label"><input type="checkbox" id="stab_onlyAI"><span>只朗读 AI 生成的文字</span></label>
     <label class="checkbox_label"><input type="checkbox" id="stab_autoPlay"><span>自动朗诵新消息</span></label>
     <label class="checkbox_label"><input type="checkbox" id="stab_autoVoice"><span>自动切换声线（旁白 / 男声 / 女声）</span></label>
@@ -565,6 +571,7 @@ function settingsHtml() {
     <label class="checkbox_label"><input type="checkbox" id="stab_skipParen"><span>跳过括号里的内容（）【】[]</span></label>
     <div class="stab-row"><label>整段忽略的标签（逗号分隔）</label><input type="text" id="stab_skipTags" class="text_pole"></div>
 
+    <div class="stab-row"><label>每段最多字数（本地音源用；越小越不卡，但停顿更多）</label><input type="number" id="stab_chunkLen" class="text_pole" min="12" max="80" step="2"></div>
     <div class="stab-row"><label>语速 <span id="stab_speed_v"></span></label><input type="range" id="stab_speed" min="0.6" max="2" step="0.1"></div>
     <div class="stab-row"><label>音量 <span id="stab_volume_v"></span></label><input type="range" id="stab_volume" min="0.1" max="1" step="0.05"></div>
   </div>
@@ -573,13 +580,14 @@ function settingsHtml() {
 
 function bindSettings() {
     const s = S();
-    const checks = ['enabled', 'onlyAI', 'autoPlay', 'autoVoice', 'readNarration', 'readDialogue', 'skipParen'];
+    const checks = ['enabled', 'autoLoad', 'showFab', 'onlyAI', 'autoPlay', 'autoVoice', 'readNarration', 'readDialogue', 'skipParen'];
     for (const k of checks) {
-        $('#stab_' + k).prop('checked', !!s[k]).on('change', function () { s[k] = this.checked; saveSettingsDebounced(); });
+        $('#stab_' + k).prop('checked', !!s[k]).on('change', function () { s[k] = this.checked; saveSettingsDebounced(); updateBar(); });
     }
     $('#stab_engine').val(s.engine).on('change', function () { s.engine = this.value; saveSettingsDebounced(); });
     $('#stab_userGender').val(s.userGender).on('change', function () { s.userGender = this.value; saveSettingsDebounced(); });
     $('#stab_skipTags').val(s.skipTags).on('input', function () { s.skipTags = this.value; saveSettingsDebounced(); });
+    $('#stab_chunkLen').val(s.chunkLen).on('change', function () { s.chunkLen = clamp(parseInt(this.value, 10) || 30, 12, 80); this.value = s.chunkLen; saveSettingsDebounced(); });
     $('#stab_scanCount').val(s.scanCount).on('change', function () { s.scanCount = clamp(parseInt(this.value, 10) || 40, 5, 300); saveSettingsDebounced(); });
     for (const [k, label] of [['speed', '#stab_speed_v'], ['volume', '#stab_volume_v']]) {
         $('#stab_' + k).val(s[k]).on('input', function () { s[k] = parseFloat(this.value); $(label).text(s[k].toFixed(2)); saveSettingsDebounced(); });
@@ -608,7 +616,8 @@ function bindSettings() {
 /* ---------------- 悬浮播放条 & 消息按钮 ---------------- */
 
 function createBar() {
-    $('body').append(`
+    // 挂在 <html> 下而不是 <body> 下：有些主题会给 body 加变换，导致固定定位跑到屏幕外
+    $(document.documentElement).append(`
 <div id="stab_bar" class="stab-idle">
   <div class="stab-fab fa-solid fa-headphones" id="stab_fab" title="朗读最新一条"></div>
   <div class="stab-controls">
@@ -646,14 +655,15 @@ function updateBar() {
     bar.toggleClass('stab-idle', !active).toggleClass('stab-active', active);
     $('#stab_pp').toggleClass('fa-pause', P.state === 'playing').toggleClass('fa-play', P.state === 'paused');
     $('#stab_rate').text(Number(S().speed).toFixed(1) + '×');
-    bar.toggle(!!S().enabled);
+    bar.toggle(!!S().enabled && (!!S().showFab || active));
 }
 
 function injectMessageButtons() {
     $('#chat .mes').each(function () {
         const mes = $(this);
         if (mes.find('.stab-msg-btn').length) return;
-        const host = mes.find('.extraMesButtons').first().length ? mes.find('.extraMesButtons').first() : mes.find('.mes_buttons').first();
+        // 放进一直可见的按钮行，而不是折叠在「…」里的那一行
+        const host = mes.find('.mes_buttons').first();
         if (!host.length) return;
         host.prepend('<div class="mes_button stab-msg-btn fa-solid fa-headphones" title="朗读这条消息"></div>');
     });
@@ -684,6 +694,35 @@ function bindChatEvents() {
     eventSource.on(event_types.CHAT_CHANGED, () => { stopAll(); setTimeout(() => { injectMessageButtons(); refreshCharGenderUI(); }, 300); });
 }
 
+/* ---------------- 魔法棒菜单入口 ---------------- */
+
+function openSettings() {
+    try {
+        if (!$('#rm_extensions_block').is(':visible')) $('#extensions-settings-button .drawer-toggle').trigger('click');
+        if (!$('#stab_drawer .inline-drawer-content').is(':visible')) $('#stab_drawer .inline-drawer-toggle').trigger('click');
+        setTimeout(() => { const el = document.getElementById('stab_drawer'); if (el) el.scrollIntoView({ block: 'start' }); }, 300);
+    } catch (e) { console.error('[听书] 打开设置失败', e); }
+}
+
+function addWandItems() {
+    const menu = $('#extensionsMenu');
+    if (!menu.length || $('#stab_wand_read').length) return;
+    menu.append(`
+<div id="stab_wand_read" class="list-group-item flex-container flexGap5" title="朗读最新一条；正在朗读时点它是暂停/继续">
+  <div class="fa-solid fa-headphones extensionsMenuExtensionButton"></div>听书：朗读最新消息
+</div>
+<div id="stab_wand_settings" class="list-group-item flex-container flexGap5" title="打开听书设置">
+  <div class="fa-solid fa-sliders extensionsMenuExtensionButton"></div>听书：设置
+</div>`);
+    $('#stab_wand_read').on('click', () => {
+        getAudioCtx();
+        if (P.state !== 'idle') { togglePause(); return; }
+        const id = lastReadableMesId();
+        if (id >= 0) playMessage(id); else say('info', '没有可朗读的消息');
+    });
+    $('#stab_wand_settings').on('click', openSettings);
+}
+
 /* ---------------- 启动 ---------------- */
 
 jQuery(async () => {
@@ -691,6 +730,7 @@ jQuery(async () => {
     $('#extensions_settings2').append(settingsHtml());
     bindSettings();
     createBar();
+    addWandItems();
     bindChatEvents();
     updateBar();
     // 手机浏览器要求有过一次点击之后才能出声：第一次触摸时解锁
@@ -698,7 +738,12 @@ jQuery(async () => {
     try { speechSynthesis.addEventListener('voiceschanged', refreshVoiceSelects); } catch { /* 忽略 */ }
 
     if (await probeSherpa()) {
-        setStatus('检测到本地音源文件，点「加载本地音源」或直接开始朗读（首次加载需几十秒）');
+        if (S().autoLoad && S().engine !== 'system') {
+            setStatus('检测到本地音源文件，几秒后自动加载…');
+            setTimeout(() => ensureSherpa(), 4000);
+        } else {
+            setStatus('检测到本地音源文件，点「加载本地音源」或直接开始朗读（首次加载需几十秒）');
+        }
     } else {
         setStatus('未找到本地音源文件，目前使用系统语音');
     }
