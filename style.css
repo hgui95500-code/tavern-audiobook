@@ -1,0 +1,56 @@
+/* 听书 Audiobook */
+#stab_drawer .stab-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 6px 0;
+}
+#stab_drawer .stab-row > label { flex: 1 1 100%; font-size: 0.9em; opacity: 0.9; }
+#stab_drawer .stab-row > select,
+#stab_drawer .stab-row > input[type="text"],
+#stab_drawer .stab-row > input[type="number"] { flex: 1 1 0; min-width: 0; }
+#stab_drawer .stab-row > input[type="range"] { flex: 1 1 100%; }
+#stab_drawer .stab-row small { opacity: 0.8; line-height: 1.4; }
+#stab_drawer .stab-buttons .menu_button { flex: 1 1 0; text-align: center; }
+#stab_drawer .stab-test { flex: 0 0 auto; padding: 4px 10px; }
+
+/* 悬浮播放条 */
+#stab_bar {
+    position: fixed;
+    right: 10px;
+    bottom: 150px;
+    z-index: 3000;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px;
+    border-radius: 24px;
+    background: var(--SmartThemeBlurTintColor, rgba(30, 30, 30, 0.85));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+    backdrop-filter: blur(6px);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+#stab_bar .stab-fab,
+#stab_bar .stab-btn {
+    min-width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 18px;
+    cursor: pointer;
+    color: var(--SmartThemeBodyColor, #eee);
+    font-size: 15px;
+}
+#stab_bar .stab-fab:active,
+#stab_bar .stab-btn:active { background: rgba(255, 255, 255, 0.18); }
+#stab_bar .stab-controls { display: none; align-items: center; gap: 2px; }
+#stab_bar.stab-active .stab-controls { display: flex; }
+#stab_bar.stab-active .stab-fab { display: none; }
+#stab_bar #stab_rate { font-size: 12px; padding: 0 6px; }
+
+/* 正在朗读的消息 */
+#chat .mes.stab-playing { box-shadow: inset 3px 0 0 var(--SmartThemeQuoteColor, #6aa9ff); }
