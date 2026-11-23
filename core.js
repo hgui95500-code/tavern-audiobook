@@ -3,7 +3,7 @@
  * 1. 跳过/移除 <...> 标签及常见正文状态栏（在切分句子前彻底清理）
  * 2. 音源单例复用 + 音频缓存（避免每次重加载音源、重复合成同一段文本）
  * 3. 先扫描要读哪些 -> 全部生成音频（每段间让出主线程减少卡顿） -> 再按顺序读出来
- * 4. 支持上一句 / 下一句 / 暂停与继续 / 停止 / 倍速切换
+ * 4. 完整支持：暂停朗诵 / 继续朗诵 / 上一句 / 下一句 / 停止 / 倍速切换
  */
 
 export function sanitizeAudiobookText(rawText, customOptions = {}) {
@@ -11,23 +11,23 @@ export function sanitizeAudiobookText(rawText, customOptions = {}) {
 
   let text = rawText;
 
-  // 1. 移除所有 <...> 标签及其内容（支持嵌套标签，例如 <details><summary>...</summary>...</details>）
+  // 1. 移除所有 <...> 标签及其内容（支持嵌套标签）
   let prev;
   do {
     prev = text;
     text = text.replace(/<[^<>]*>/g, "");
   } while (text !== prev);
 
-  // 2. 移除常见状态栏：三引号代码块状态栏
+  // 2. 移除代码块状态栏
   text = text.replace(/```[\s\S]*?```/g, "");
 
-  // 3. 移除独立成段的状态栏 / 面板 / 属性块（如 --- 状态 ---、【状态栏】、[状态] 等）
+  // 3. 移除独立成段的状态栏 / 面板 / 属性块
   text = text.replace(
     /(?:^|\n)[ \t]*(?:[-─═=*]{3,}|[【\[](?:状态|属性|面板|系统|数值|好感|背包|时间|地点|角色卡|状态栏|信息栏)[^\n\]]*[】\]])[\s\S]*?(?=\n{2,}|$)/g,
     "\n"
   );
 
-  // 4. 移除单行状态字段（如“好感度：60 / 生命值：100/100 / 当前状态：...”或带竖线分隔的状态行）
+  // 4. 移除单行状态字段与带状态关键词的竖线分隔行
   text = text.replace(
     /^.*(?:好感度|心情值|理智值|当前状态|生命值|体力值|精力值|饥饿度|MP|HP)[：:].*$/gm,
     ""
@@ -55,7 +55,7 @@ export function sanitizeAudiobookText(rawText, customOptions = {}) {
 }
 
 export function splitIntoSegments(cleanedText, options = {}) {
-  const maxChars = Number(options.maxChars) > 0 ? Number(options.maxChars) : 45;
+  const maxChars = Number(options.maxChars) > 0 ? Number(options.maxChars) : 40;
   const readNarration = options.readNarration !== false;
   const readDialogue = options.readDialogue !== false;
   const skipBrackets = Boolean(options.skipBrackets);
@@ -139,9 +139,6 @@ function chunkTextByLength(text, maxChars) {
   return result;
 }
 
-/**
- * 将 float32 采样转为标准 WAV Blob URL，便于浏览器稳定播放
- */
 export function samplesToWavBlobUrl(samples, sampleRate = 22050) {
   if (!samples || !samples.length) return "";
   const numSamples = samples.length;
@@ -159,8 +156,8 @@ export function samplesToWavBlobUrl(samples, sampleRate = 22050) {
   writeString(8, "WAVE");
   writeString(12, "fmt ");
   view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // Mono
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true);
@@ -194,11 +191,9 @@ export class AudiobookEngine {
     this.currentVolume = 1.0;
     this.onProgressCb = null;
     this._stepResolver = null;
+    this._resumeResolver = null;
   }
 
-  /**
-   * 音源单例复用：只加载一次，后续直接使用已加载实例
-   */
   async ensureLocalTtsLoaded(onStatus) {
     if (this.localTtsInstance) {
       return this.localTtsInstance;
@@ -242,42 +237,88 @@ export class AudiobookEngine {
     }
   }
 
-  togglePause() {
-    if (this.currentAudio) {
-      if (this.currentAudio.paused) {
-        this.isPaused = false;
-        this.currentAudio.play().catch(() => {});
-        this.onProgressCb?.({
-          stage: "playing",
-          current: this.currentIndex + 1,
-          total: this.playlist.length,
-          paused: false,
-          message: `正在朗读 (${this.currentIndex + 1}/${this.playlist.length})`,
-        });
-      } else {
-        this.isPaused = true;
-        this.currentAudio.pause();
-        this.onProgressCb?.({
-          stage: "paused",
-          current: this.currentIndex + 1,
-          total: this.playlist.length,
-          paused: true,
-          message: `已暂停 (${this.currentIndex + 1}/${this.playlist.length})`,
-        });
-      }
-      return this.isPaused;
+  /**
+   * 暂停朗诵
+   */
+  pause() {
+    if (this.isStopped || !this.playlist.length || this.isPaused) return false;
+    this.isPaused = true;
+
+    if (this.currentAudio && !this.currentAudio.paused) {
+      this.currentAudio.pause();
+    }
+    if (typeof window !== "undefined" && window.speechSynthesis && window.speechSynthesis.speaking) {
+      try {
+        window.speechSynthesis.pause();
+      } catch (_) {}
     }
 
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      if (window.speechSynthesis.paused) {
-        this.isPaused = false;
-        window.speechSynthesis.resume();
-      } else if (window.speechSynthesis.speaking) {
-        this.isPaused = true;
-        window.speechSynthesis.pause();
-      }
+    this._emitPauseState(true);
+    return true;
+  }
+
+  /**
+   * 继续朗诵
+   */
+  resume() {
+    if (this.isStopped || !this.playlist.length || !this.isPaused) return false;
+    this.isPaused = false;
+
+    if (this.currentAudio && this.currentAudio.paused) {
+      this.currentAudio.play().catch(() => {});
     }
-    return this.isPaused;
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      try {
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+      } catch (_) {}
+    }
+
+    this._emitPauseState(false);
+
+    if (this._resumeResolver) {
+      const resolve = this._resumeResolver;
+      this._resumeResolver = null;
+      resolve();
+    }
+    return true;
+  }
+
+  /**
+   * 切换暂停/继续
+   */
+  togglePause() {
+    if (!this.playlist.length) return false;
+    if (this.isPaused) {
+      this.resume();
+      return false;
+    } else {
+      this.pause();
+      return true;
+    }
+  }
+
+  _emitPauseState(paused) {
+    const total = this.playlist.length;
+    const current = Math.min(total, this.currentIndex + 1);
+    this.onProgressCb?.({
+      stage: paused ? "paused" : "playing",
+      current,
+      total,
+      segment: this.playlist[this.currentIndex] || null,
+      paused,
+      message: paused
+        ? `已暂停朗诵 (${current}/${total})`
+        : `正在朗读 (${current}/${total})`,
+    });
+  }
+
+  _waitIfPaused() {
+    if (!this.isPaused || this.isStopped) return Promise.resolve();
+    return new Promise((resolve) => {
+      this._resumeResolver = resolve;
+    });
   }
 
   prev() {
@@ -294,6 +335,11 @@ export class AudiobookEngine {
 
   _jumpToCurrent() {
     this.isPaused = false;
+    if (this._resumeResolver) {
+      const r = this._resumeResolver;
+      this._resumeResolver = null;
+      r();
+    }
     this._stopCurrentPlaybackOnly();
     if (this._stepResolver) {
       const resolve = this._stepResolver;
@@ -321,12 +367,18 @@ export class AudiobookEngine {
     this.playlist = [];
     this.currentIndex = 0;
     this._stopCurrentPlaybackOnly();
+
+    if (this._resumeResolver) {
+      const r = this._resumeResolver;
+      this._resumeResolver = null;
+      r();
+    }
     if (this._stepResolver) {
       const resolve = this._stepResolver;
       this._stepResolver = null;
       resolve("stop");
     }
-    this.onProgressCb?.({ stage: "stopped", message: "已停止朗读" });
+    this.onProgressCb?.({ stage: "stopped", paused: false, message: "已停止朗读" });
   }
 
   /**
@@ -335,6 +387,7 @@ export class AudiobookEngine {
   async scanGenerateAllAndPlay(rawText, config = {}, callbacks = {}) {
     this.stop();
     this.isStopped = false;
+    this.isPaused = false;
     this.currentRate = Number(config.rate) > 0 ? Number(config.rate) : 1.0;
     this.currentVolume =
       config.volume !== undefined ? Math.min(1, Math.max(0, Number(config.volume))) : 1.0;
@@ -362,7 +415,7 @@ export class AudiobookEngine {
       message: `扫描完成（共 ${segments.length} 段），准备全部生成...`,
     });
 
-    // 2. 确保本地音源已加载（已加载则直接复用，不再重复加载）
+    // 2. 确保本地音源已加载（已加载则直接复用）
     let ttsInstance = null;
     if (config.engine !== "system" && typeof synthesizeSegment === "function") {
       ttsInstance = await this.ensureLocalTtsLoaded((msg) =>
@@ -370,7 +423,7 @@ export class AudiobookEngine {
       );
     }
 
-    // 3. 全部生成音频（逐段生成并让出主线程，避免手机浏览器连续推理卡死）
+    // 3. 全部生成音频（每段间让出主线程减少卡顿）
     const builtPlaylist = [];
     const yieldGap = Math.max(15, Number(config.yieldMs) || 35);
 
@@ -408,7 +461,6 @@ export class AudiobookEngine {
         message: `全部生成中：${i + 1} / ${segments.length}`,
       });
 
-      // 让出主线程，缓解手机端连续合成导致的界面卡顿
       await new Promise((r) => setTimeout(r, yieldGap));
     }
 
@@ -428,8 +480,11 @@ export class AudiobookEngine {
       message: `全部 ${this.playlist.length} 段已生成，开始朗读`,
     });
 
-    // 4. 全部生成完成后，再按顺序读出来
+    // 4. 全部生成完成后，按顺序读出来
     while (!this.isStopped && this.currentIndex < this.playlist.length) {
+      await this._waitIfPaused();
+      if (this.isStopped) return;
+
       const idx = this.currentIndex;
       const item = this.playlist[idx];
 
@@ -445,7 +500,6 @@ export class AudiobookEngine {
       const reason = await this._playSingleItem(item);
       if (this.isStopped || reason === "stop") return;
       if (reason === "jump") {
-        // currentIndex 已由 prev() / next() 更新
         continue;
       }
       this.currentIndex = idx + 1;
@@ -454,7 +508,8 @@ export class AudiobookEngine {
     if (!this.isStopped) {
       this.playlist = [];
       this.currentIndex = 0;
-      this.onProgressCb?.({ stage: "completed", message: "朗读完成" });
+      this.isPaused = false;
+      this.onProgressCb?.({ stage: "completed", paused: false, message: "朗读完成" });
     }
   }
 

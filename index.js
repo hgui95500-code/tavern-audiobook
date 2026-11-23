@@ -1,30 +1,21 @@
 import { AudiobookEngine, samplesToWavBlobUrl } from "./core.js";
 
-/**
- * 听书 Audiobook（SillyTavern 扩展入口）
- * 特点：
- * 1. 不在启动时自动加载大模型；首次使用时加载并复用单例，不再每次重加载
- * 2. 扫描时自动跳过 <...> 标签与正文状态栏
- * 3. 扫描完成后全部生成音频，再按顺序读出来
- * 4. 保留扩展设置面板、消息按钮 🎧 与右下角悬浮播放条 #stab_bar
- */
-
 const MODULE_NAME = "tavern_audiobook";
 const RATES = [0.8, 1.0, 1.25, 1.5, 2.0];
 
 const DEFAULT_SETTINGS = {
   enabled: true,
-  engine: "local",          // "local" (Sherpa/Kokoro) | "system" (系统语音)
+  engine: "local",
   autoLoadLocalModel: false,
   autoPlayNewAiMsg: false,
   narrationVoiceId: 0,
   dialogueVoiceId: 1,
-  maxChars: 40,             // 默认调小，减少手机单次合成卡顿
-  yieldMs: 40,              // 每段合成后让出主线程的毫秒数
+  maxChars: 40,
+  yieldMs: 40,
   readNarration: true,
   readDialogue: true,
   skipBrackets: true,
-  rateIndex: 1,             // 对应 1.0
+  rateIndex: 1,
   volume: 1.0,
   ignoredTagsText: "think,status,state,panel",
   sherpaModelDir: "./sherpa",
@@ -52,10 +43,6 @@ function saveSettings(settings) {
   return settings;
 }
 
-/**
- * 加载本地 Sherpa-ONNX (Kokoro) 音源（单例复用）
- * 若你的环境全局或模块已有初始化函数，可直接在此接入
- */
 async function initSherpaTts(onStatus) {
   const settings = getSettings();
   const baseDir = (settings.sherpaModelDir || "./sherpa").replace(/\/+$/, "");
@@ -98,9 +85,6 @@ async function initSherpaTts(onStatus) {
   return tts;
 }
 
-/**
- * 单段合成：返回可播放的 WAV Blob URL
- */
 async function synthesizeWithSherpa(segment, voiceId, ttsInstance) {
   const sid = Number.isFinite(Number(voiceId)) ? Number(voiceId) : 0;
   const generated = await ttsInstance.generate({
@@ -114,7 +98,6 @@ async function synthesizeWithSherpa(segment, voiceId, ttsInstance) {
 }
 
 const engine = new AudiobookEngine(initSherpaTts);
-let activeMessageElement = null;
 
 function setStatusText(text) {
   const el = document.getElementById("stab_status_text");
@@ -128,7 +111,6 @@ function setActiveMessageHighlight(mesEl) {
   if (mesEl) {
     mesEl.classList.add("stab-playing");
   }
-  activeMessageElement = mesEl || null;
 }
 
 function updateFloatingBarState(state) {
@@ -144,11 +126,17 @@ function updateFloatingBarState(state) {
   if (state === "active") {
     bar.classList.remove("stab-idle");
     bar.classList.add("stab-active");
-    if (pauseBtn) pauseBtn.textContent = engine.isPaused ? "▶" : "⏸";
+    if (pauseBtn) {
+      pauseBtn.textContent = engine.isPaused ? "▶" : "⏸";
+      pauseBtn.title = engine.isPaused ? "继续朗诵" : "暂停朗诵";
+    }
   } else {
     bar.classList.remove("stab-active");
     bar.classList.add("stab-idle");
-    if (pauseBtn) pauseBtn.textContent = "⏸";
+    if (pauseBtn) {
+      pauseBtn.textContent = "⏸";
+      pauseBtn.title = "暂停朗诵";
+    }
   }
 }
 
@@ -184,7 +172,8 @@ export async function speakFromMessageElement(mesEl, rawText) {
   updateFloatingBarState("active");
 
   const ignoredTags = (settings.ignoredTagsText || "")
-    .split(/[,，\n]+/)
+    .split(/[,，
+]+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
@@ -207,7 +196,7 @@ export async function speakFromMessageElement(mesEl, rawText) {
           if (info?.message) {
             setStatusText(info.message);
           }
-          if (info?.stage === "playing") {
+          if (info?.stage === "playing" || info?.stage === "paused") {
             updateFloatingBarState("active");
           } else if (
             info?.stage === "completed" ||
@@ -232,6 +221,21 @@ export async function speakFromMessageElement(mesEl, rawText) {
     setActiveMessageHighlight(null);
     updateFloatingBarState("idle");
   }
+}
+
+export function pauseAudiobook() {
+  engine.pause();
+  updateFloatingBarState(engine.playlist?.length ? "active" : "idle");
+}
+
+export function resumeAudiobook() {
+  engine.resume();
+  updateFloatingBarState(engine.playlist?.length ? "active" : "idle");
+}
+
+export function togglePauseAudiobook() {
+  engine.togglePause();
+  updateFloatingBarState(engine.playlist?.length ? "active" : "idle");
 }
 
 export function stopAudiobook() {
@@ -273,7 +277,7 @@ function createFloatingBar() {
     <div class="stab-fab" id="stab_fab" title="朗读最新一条回复">🎧</div>
     <div class="stab-controls">
       <div class="stab-btn" id="stab_prev" title="上一句">⏮</div>
-      <div class="stab-btn" id="stab_pause" title="暂停/继续">⏸</div>
+      <div class="stab-btn" id="stab_pause" title="暂停朗诵">⏸</div>
       <div class="stab-btn" id="stab_next" title="下一句">⏭</div>
       <div class="stab-btn" id="stab_stop" title="停止">⏹</div>
       <div class="stab-btn" id="stab_rate" title="切换语速">1x</div>
@@ -292,8 +296,7 @@ function createFloatingBar() {
   });
 
   document.getElementById("stab_pause")?.addEventListener("click", () => {
-    engine.togglePause();
-    updateFloatingBarState("active");
+    togglePauseAudiobook();
   });
 
   document.getElementById("stab_next")?.addEventListener("click", () => {
@@ -372,6 +375,11 @@ function createSettingsPanel() {
       </div>
 
       <div class="stab-row stab-buttons">
+        <div id="stab_btn_pause_toggle" class="menu_button">暂停/继续朗诵</div>
+        <div id="stab_btn_stop" class="menu_button">停止朗诵</div>
+      </div>
+
+      <div class="stab-row stab-buttons">
         <div id="stab_btn_load" class="menu_button">手动加载/复用音源</div>
         <div id="stab_btn_clear_cache" class="menu_button">清理音频缓存</div>
       </div>
@@ -406,6 +414,14 @@ function createSettingsPanel() {
   bindChange("stab_read_dialogue", (s, el) => { s.readDialogue = el.checked; });
   bindChange("stab_skip_brackets", (s, el) => { s.skipBrackets = el.checked; });
   bindChange("stab_auto_play", (s, el) => { s.autoPlayNewAiMsg = el.checked; });
+
+  document.getElementById("stab_btn_pause_toggle")?.addEventListener("click", () => {
+    togglePauseAudiobook();
+  });
+
+  document.getElementById("stab_btn_stop")?.addEventListener("click", () => {
+    stopAudiobook();
+  });
 
   document.getElementById("stab_btn_load")?.addEventListener("click", async () => {
     try {
